@@ -1,0 +1,4 @@
+requests
+pandas==2.2.3
+numpy
+matplotlib==3.8.4

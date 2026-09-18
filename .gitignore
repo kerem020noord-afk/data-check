@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+gold_analysis.csv
+gold_chart.png

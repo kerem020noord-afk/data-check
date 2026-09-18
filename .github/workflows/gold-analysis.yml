@@ -1,0 +1,29 @@
+name: Gold XAUUSD analyse
+
+on:
+  schedule:
+    # Draait elke 5 minuten. GitHub kan dit onder drukke omstandigheden een
+    # paar minuten vertragen; dat is een limiet van GitHub Actions zelf.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # laat je de workflow ook handmatig starten vanaf de Actions-tab
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository uitchecken
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Dependencies installeren
+        run: pip install -r requirements.txt
+
+      - name: Analyse uitvoeren
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python gold_analysis.py --once
