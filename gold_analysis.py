@@ -1,12 +1,14 @@
 """
 Gold (XAUUSD) analyse-script.
 
-Haalt de actuele XAUUSD-prijs op (gold-api.com, geen key nodig; met Yahoo
-Finance COMEX-futures GC=F als automatische backup als gold-api.com niet
-bereikbaar is) en 90 dagen historische dagdata (ook via Yahoo Finance GC=F,
-als gratis proxy omdat gold-api.com geen historie levert). Berekent SMA20,
-SMA50, RSI14 en steun/weerstand-niveaus, detecteert een regelgebaseerd
-buy/sell-signaal en stuurt daarbij optioneel een pushmelding via ntfy.sh.
+Haalt zowel de actuele prijs als 90 dagen historische dagdata op van dezelfde
+bron: Binance's PAXG/USDT-markt. PAXG is een token dat 1-op-1 inwisselbaar is
+voor 1 troy ounce fysiek goud en volgt daardoor de spotprijs van goud veel
+directer dan COMEX-futures (die een prijsverschil van tientallen dollars met
+spot kunnen hebben door contango). Geen API-key nodig, geen relevante
+rate-limit voor een check elke paar minuten. Berekent SMA20, SMA50, RSI14 en
+steun/weerstand-niveaus, detecteert een regelgebaseerd buy/sell-signaal en
+stuurt daarbij optioneel een pushmelding via ntfy.sh.
 
 Twee manieren om te draaien:
   - python gold_analysis.py         -> blijft continu draaien (elke
@@ -70,9 +72,12 @@ HEARTBEAT_EVERY_N_CHECKS = max(1, round(HEARTBEAT_INTERVAL_MINUTES / CHECK_INTER
 # hieronder is alleen de fallback voor lokaal draaien zonder die variabele.
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kerim-goud-signalen-1x61")
 
-CURRENT_PRICE_URL = "https://api.gold-api.com/price/XAU"
-HISTORY_URL = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
-HISTORY_PARAMS = {"range": "90d", "interval": "1d"}
+# Eén bron voor zowel de live prijs als de historische candles, zodat er
+# nooit een spot/futures-mismatch binnen één check kan ontstaan.
+SPOT_SYMBOL = "PAXGUSDT"
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+HISTORY_PARAMS = {"symbol": SPOT_SYMBOL, "interval": "1d", "limit": 100}
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 SMA_SHORT = 20
@@ -85,6 +90,14 @@ PROXIMITY_PCT = 0.003     # 0.3% afstand tot een niveau voor een signaal
 SL_BUFFER_PCT = 0.002     # 0.2% buffer voorbij het niveau voor de stop loss
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
+
+# Prijsactie-detectie (naast RSI), zodat sterke bewegingen ook zonder RSI-
+# extreem een setup kunnen triggeren:
+MOMENTUM_LOOKBACK = 20        # aantal candles voor de gemiddelde range-baseline
+MOMENTUM_RANGE_MULTIPLIER = 1.8  # candle-range moet dit x groter zijn dan het gemiddelde
+REJECTION_PROXIMITY_PCT = 0.005  # hoe dicht high/low een niveau moet raken (0,5%)
+REJECTION_WICK_RATIO = 0.55      # schaduw moet minstens dit deel van de candle-range zijn
+TREND_CONFIRM_CANDLES = 3        # opeenvolgende hogere/lagere toppen+bodems voor trendbevestiging
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(SCRIPT_DIR, "gold_analysis.csv")
@@ -118,48 +131,50 @@ def _get_with_retry(url, timeout=10, retries=1, backoff=3, **kwargs):
     raise last_exc
 
 
-def _fetch_history_payload():
-    resp = _get_with_retry(HISTORY_URL, params=HISTORY_PARAMS, timeout=15)
-    return resp.json()["chart"]["result"][0]
+def _fetch_klines():
+    resp = _get_with_retry(BINANCE_KLINES_URL, params=HISTORY_PARAMS, timeout=15)
+    return resp.json()
 
 
 def fetch_current_price():
+    # Zelfde bron (Binance) als fetch_history(), zodat prijs en candles nooit
+    # uit twee verschillende markten komen binnen één check. Als de losse
+    # ticker-aanroep faalt, valt dit terug op de laatste klines-close van
+    # dezelfde bron — geen kruisbestuiving met een andere markt/aanbieder.
     try:
-        resp = _get_with_retry(CURRENT_PRICE_URL, timeout=10)
+        resp = _get_with_retry(BINANCE_TICKER_URL, params={"symbol": SPOT_SYMBOL}, timeout=10)
         return float(resp.json()["price"])
     except Exception as primary_error:
-        print(f"Let op: gold-api.com niet bereikbaar ({primary_error}); "
-              f"val terug op Yahoo Finance (COMEX-futures GC=F) voor de actuele prijs.")
         try:
-            result = _fetch_history_payload()
-            return float(result["meta"]["regularMarketPrice"])
+            klines = _fetch_klines()
+            return float(klines[-1][4])  # index 4 = close
         except Exception as fallback_error:
             raise RuntimeError(
-                "Kan de actuele XAUUSD-prijs niet ophalen: gold-api.com faalde "
-                f"({primary_error}) en de Yahoo Finance-backup faalde ook ({fallback_error})"
+                "Kan de actuele XAUUSD-prijs (via PAXG/USDT op Binance) niet ophalen: "
+                f"ticker-endpoint faalde ({primary_error}) en de klines-backup faalde ook ({fallback_error})"
             )
 
 
 def fetch_history():
     try:
-        result = _fetch_history_payload()
-        quote = result["indicators"]["quote"][0]
+        klines = _fetch_klines()
         df = pd.DataFrame(
-            {
-                "Date": pd.to_datetime(result["timestamp"], unit="s").normalize(),
-                "Open": quote["open"],
-                "High": quote["high"],
-                "Low": quote["low"],
-                "Close": quote["close"],
-                "Volume": quote["volume"],
-            }
+            klines,
+            columns=[
+                "OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
+                "QuoteVolume", "Trades", "TakerBaseVolume", "TakerQuoteVolume", "Ignore",
+            ],
         )
+        df["Date"] = pd.to_datetime(df["OpenTime"], unit="ms").dt.normalize()
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            df[col] = df[col].astype(float)
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df = df.dropna(subset=["Close"]).reset_index(drop=True)
         if df.empty:
             raise ValueError("lege historische dataset ontvangen")
         return df
     except Exception as e:
-        raise RuntimeError(f"Kan historische XAUUSD-data niet ophalen: {e}")
+        raise RuntimeError(f"Kan historische XAUUSD-data (via PAXG/USDT op Binance) niet ophalen: {e}")
 
 
 def compute_rsi(close, period=RSI_PERIOD):
@@ -219,8 +234,8 @@ def nearest_level(levels, price, direction):
     return min(candidates) if candidates else None
 
 
-def build_buy_signal(entry, support, resistance_levels):
-    sl = support * (1 - SL_BUFFER_PCT)
+def build_buy_signal(entry, sl_ref, resistance_levels, reasons):
+    sl = sl_ref * (1 - SL_BUFFER_PCT)
     targets = sorted(r for r in resistance_levels if r > entry)
     tp1 = targets[0] if targets else None
     tp2 = targets[1] if len(targets) > 1 else None
@@ -235,12 +250,13 @@ def build_buy_signal(entry, support, resistance_levels):
         "tp2": tp2,
         "rr1": rr1,
         "rr2": rr2,
-        "level": support,
+        "level": sl_ref,
+        "reasons": reasons,
     }
 
 
-def build_sell_signal(entry, resistance, support_levels):
-    sl = resistance * (1 + SL_BUFFER_PCT)
+def build_sell_signal(entry, sl_ref, support_levels, reasons):
+    sl = sl_ref * (1 + SL_BUFFER_PCT)
     targets = sorted((s for s in support_levels if s < entry), reverse=True)
     tp1 = targets[0] if targets else None
     tp2 = targets[1] if len(targets) > 1 else None
@@ -255,22 +271,118 @@ def build_sell_signal(entry, resistance, support_levels):
         "tp2": tp2,
         "rr1": rr1,
         "rr2": rr2,
-        "level": resistance,
+        "level": sl_ref,
+        "reasons": reasons,
     }
 
 
-def detect_signal(current_price, rsi, support_levels, resistance_levels,
-                   nearest_support, nearest_resistance):
-    if rsi is None:
+def detect_momentum_candle(df, lookback=MOMENTUM_LOOKBACK, multiplier=MOMENTUM_RANGE_MULTIPLIER):
+    # Een candle-range die significant groter is dan het gemiddelde van de
+    # laatste `lookback` candles duidt op een sterke stoot in een richting,
+    # ook als de RSI (die alleen naar close-to-close kijkt) neutraal blijft.
+    if len(df) < lookback + 1:
         return None
+    ranges = df["High"] - df["Low"]
+    avg_range = ranges.iloc[-(lookback + 1):-1].mean()
+    last_range = ranges.iloc[-1]
+    if avg_range <= 0:
+        return None
+    ratio = last_range / avg_range
+    if ratio < multiplier:
+        return None
+    last = df.iloc[-1]
+    direction = "BUY" if last["Close"] >= last["Open"] else "SELL"
+    return {
+        "direction": direction,
+        "reason": f"sterke momentum-candle: range {ratio:.1f}x groter dan gemiddelde van laatste {lookback} candles",
+    }
+
+
+def detect_rejection_candle(df, nearest_support, nearest_resistance,
+                             proximity_pct=REJECTION_PROXIMITY_PCT, wick_ratio=REJECTION_WICK_RATIO):
+    # Een candle die een niveau test (high/low raakt het) maar terugvalt met
+    # een lange schaduw in de richting van de afwijzing, is een klassiek
+    # prijsactie-signaal dat RSI-drempels volledig kunnen missen.
+    last = df.iloc[-1]
+    candle_range = last["High"] - last["Low"]
+    if candle_range <= 0:
+        return None
+    body_top = max(last["Open"], last["Close"])
+    body_bottom = min(last["Open"], last["Close"])
+    upper_wick = last["High"] - body_top
+    lower_wick = body_bottom - last["Low"]
+
+    if nearest_resistance is not None:
+        dist = abs(last["High"] - nearest_resistance) / nearest_resistance
+        if dist <= proximity_pct and (upper_wick / candle_range) >= wick_ratio:
+            return {
+                "direction": "SELL",
+                "reason": f"afwijzing op weerstand {nearest_resistance:.2f}: bovenschaduw is "
+                          f"{upper_wick / candle_range:.0%} van de candle-range",
+            }
     if nearest_support is not None:
+        dist = abs(last["Low"] - nearest_support) / nearest_support
+        if dist <= proximity_pct and (lower_wick / candle_range) >= wick_ratio:
+            return {
+                "direction": "BUY",
+                "reason": f"afwijzing op steun {nearest_support:.2f}: onderschaduw is "
+                          f"{lower_wick / candle_range:.0%} van de candle-range",
+            }
+    return None
+
+
+def detect_trend_confirmation(df, n=TREND_CONFIRM_CANDLES):
+    # Opeenvolgende hogere toppen+bodems (of lagere toppen+bodems) bevestigen
+    # een trend over meerdere candles, in plaats van op één losse candle te
+    # steunen.
+    if len(df) < n + 1:
+        return None
+    recent = df.iloc[-(n + 1):]
+    highs = recent["High"].values
+    lows = recent["Low"].values
+    higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
+    higher_lows = all(lows[i] > lows[i - 1] for i in range(1, len(lows)))
+    lower_highs = all(highs[i] < highs[i - 1] for i in range(1, len(highs)))
+    lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
+    if higher_highs and higher_lows:
+        return {"direction": "BUY", "reason": f"{n} opeenvolgende hogere toppen én bodems (opwaartse trend)"}
+    if lower_highs and lower_lows:
+        return {"direction": "SELL", "reason": f"{n} opeenvolgende lagere toppen én bodems (neerwaartse trend)"}
+    return None
+
+
+def detect_signal(current_price, rsi, df, support_levels, resistance_levels,
+                   nearest_support, nearest_resistance):
+    reasons_buy, reasons_sell = [], []
+
+    # 1) Bestaande logica: prijs dicht bij niveau + RSI-extreem
+    if nearest_support is not None and rsi is not None:
         dist = abs(current_price - nearest_support) / nearest_support
         if dist <= PROXIMITY_PCT and rsi < RSI_OVERSOLD:
-            return build_buy_signal(current_price, nearest_support, resistance_levels)
-    if nearest_resistance is not None:
+            reasons_buy.append(f"prijs binnen {PROXIMITY_PCT:.1%} van steun {nearest_support:.2f} en RSI oversold ({rsi:.1f})")
+    if nearest_resistance is not None and rsi is not None:
         dist = abs(current_price - nearest_resistance) / nearest_resistance
         if dist <= PROXIMITY_PCT and rsi > RSI_OVERBOUGHT:
-            return build_sell_signal(current_price, nearest_resistance, support_levels)
+            reasons_sell.append(f"prijs binnen {PROXIMITY_PCT:.1%} van weerstand {nearest_resistance:.2f} en RSI overbought ({rsi:.1f})")
+
+    # 2) Prijsactie: momentum-candle, afwijzingscandle, trendbevestiging
+    for detector_result in (
+        detect_momentum_candle(df),
+        detect_rejection_candle(df, nearest_support, nearest_resistance),
+        detect_trend_confirmation(df),
+    ):
+        if detector_result is None:
+            continue
+        target = reasons_buy if detector_result["direction"] == "BUY" else reasons_sell
+        target.append(detector_result["reason"])
+
+    # Tegenstrijdige redenen (zowel buy- als sell-argumenten) -> te onduidelijk, geen signaal
+    if reasons_buy and not reasons_sell:
+        sl_ref = nearest_support if nearest_support is not None else float(df["Low"].iloc[-1])
+        return build_buy_signal(current_price, sl_ref, resistance_levels, reasons_buy)
+    if reasons_sell and not reasons_buy:
+        sl_ref = nearest_resistance if nearest_resistance is not None else float(df["High"].iloc[-1])
+        return build_sell_signal(current_price, sl_ref, support_levels, reasons_sell)
     return None
 
 
@@ -310,6 +422,7 @@ def send_ntfy(title, message):
 def send_signal_notification(signal):
     lines = [
         f"{signal['direction']} signaal XAUUSD",
+        "Waarom: " + "; ".join(signal["reasons"]),
         f"Entry: {signal['entry']:.2f}",
         f"Stop Loss: {signal['sl']:.2f}",
     ]
@@ -393,7 +506,7 @@ def run_once(send_heartbeat=False):
     current_rsi = float(current_rsi) if pd.notna(current_rsi) else None
 
     signal = detect_signal(
-        current_price, current_rsi, support_levels, resistance_levels,
+        current_price, current_rsi, df, support_levels, resistance_levels,
         nearest_support, nearest_resistance,
     )
 
@@ -412,6 +525,9 @@ def run_once(send_heartbeat=False):
 
     if signal is not None:
         print(f">>> Mogelijk {signal['direction']}-SIGNAAL gedetecteerd <<<")
+        print("Waarom:")
+        for reason in signal["reasons"]:
+            print(f"  - {reason}")
         print(f"Entry     : {signal['entry']:.2f}")
         print(f"Stop Loss : {signal['sl']:.2f}")
         print(f"TP1       : {signal['tp1']:.2f}" if signal["tp1"] is not None else "TP1       : geen volgend niveau gevonden")
