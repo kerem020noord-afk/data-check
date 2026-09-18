@@ -10,6 +10,8 @@ on:
 jobs:
   analyse:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # nodig om heartbeat_state.txt na elke run terug te committen
     steps:
       - name: Repository uitchecken
         uses: actions/checkout@v4
@@ -27,3 +29,15 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python gold_analysis.py --once
+
+      - name: Heartbeat-status opslaan
+        run: |
+          if [ -n "$(git status --porcelain heartbeat_state.txt)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add heartbeat_state.txt
+            git commit -m "Heartbeat-status bijwerken [skip ci]"
+            git push
+          else
+            echo "Geen wijziging in heartbeat-status, niets te committen."
+          fi

@@ -89,6 +89,11 @@ RSI_OVERBOUGHT = 65
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(SCRIPT_DIR, "gold_analysis.csv")
 CHART_PATH = os.path.join(SCRIPT_DIR, "gold_chart.png")
+# Onthoudt het laatst afgehandelde heartbeat-blok. Dit bestand wordt in de
+# GitHub Actions-workflow teruggecommit naar de repo, zodat de --once modus
+# ook zonder gedeeld procesgeheugen precies 1x per HEARTBEAT_INTERVAL_MINUTES
+# een heartbeat stuurt, hoe lang een cron-tik ook vertraagd is.
+HEARTBEAT_STATE_PATH = os.path.join(SCRIPT_DIR, "heartbeat_state.txt")
 DISCLAIMER = (
     "Dit is een op regels gebaseerde indicatie, geen voorspelling. "
     "Wacht altijd op bevestiging op de grafiek zelf voordat je handelt."
@@ -455,17 +460,48 @@ def run_forever():
         sys.exit(0)
 
 
+def _heartbeat_block_start(now):
+    block_minute = (now.minute // HEARTBEAT_INTERVAL_MINUTES) * HEARTBEAT_INTERVAL_MINUTES
+    block_start = now.replace(minute=block_minute, second=0, microsecond=0)
+    return block_start.strftime("%Y-%m-%dT%H:%M")
+
+
+def should_send_heartbeat(now):
+    # Stateless-veilige heartbeat via een klein statusbestand i.p.v. een
+    # tijdvenster: "is dit een nieuw HEARTBEAT_INTERVAL_MINUTES-blok t.o.v. de
+    # laatst opgeslagen waarde?". Dat werkt correct bij elke vertraging (ook
+    # 10+ minuten of een overgeslagen tik) en stuurt nooit dubbel, ook niet als
+    # er toevallig meerdere checks binnen hetzelfde blok op tijd draaien.
+    current_block = _heartbeat_block_start(now)
+    last_block = None
+    try:
+        if os.path.exists(HEARTBEAT_STATE_PATH):
+            with open(HEARTBEAT_STATE_PATH, "r", encoding="utf-8") as f:
+                last_block = f.read().strip()
+    except OSError as e:
+        print(f"Let op: kon heartbeat-statusbestand niet lezen ({e}); "
+              f"ga uit van 'nog geen eerdere heartbeat'.")
+
+    if last_block == current_block:
+        return False
+
+    try:
+        with open(HEARTBEAT_STATE_PATH, "w", encoding="utf-8") as f:
+            f.write(current_block)
+    except OSError as e:
+        print(f"Let op: kon heartbeat-statusbestand niet wegschrijven ({e}).")
+
+    return True
+
+
 def run_once_stateless():
     # Voor gebruik in een scheduler (GitHub Actions, cron): elke aanroep is
-    # een nieuw proces zonder geheugen van vorige runs, dus de heartbeat kan
-    # niet op een teller steunen zoals in run_forever(). In plaats daarvan
-    # wordt de klok gebruikt: een heartbeat gaat binnen de eerste
-    # CHECK_INTERVAL_MINUTES van elk HEARTBEAT_INTERVAL_MINUTES-blok (bij de
-    # standaardwaarden dus rond elk :00/:20/:40), zodat het ritme ook zonder
-    # gedeeld geheugen tussen runs blijft kloppen.
+    # een nieuw proces zonder in-memory geheugen van vorige runs, dus de
+    # heartbeat-telling van run_forever() werkt hier niet. In plaats daarvan
+    # bepaalt should_send_heartbeat() dit via het statusbestand.
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    is_heartbeat = (now.minute % HEARTBEAT_INTERVAL_MINUTES) < CHECK_INTERVAL_MINUTES
+    is_heartbeat = should_send_heartbeat(now)
     try:
         run_once(send_heartbeat=is_heartbeat)
     except Exception as e:
