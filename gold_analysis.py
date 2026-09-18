@@ -2,13 +2,16 @@
 Gold (XAUUSD) analyse-script.
 
 Haalt zowel de actuele prijs als 90 dagen historische dagdata op van dezelfde
-bron: Binance's PAXG/USDT-markt. PAXG is een token dat 1-op-1 inwisselbaar is
+bron: Kraken's PAXG/USD-markt. PAXG is een token dat 1-op-1 inwisselbaar is
 voor 1 troy ounce fysiek goud en volgt daardoor de spotprijs van goud veel
 directer dan COMEX-futures (die een prijsverschil van tientallen dollars met
 spot kunnen hebben door contango). Geen API-key nodig, geen relevante
-rate-limit voor een check elke paar minuten. Berekent SMA20, SMA50, RSI14 en
-steun/weerstand-niveaus, detecteert een regelgebaseerd buy/sell-signaal en
-stuurt daarbij optioneel een pushmelding via ntfy.sh.
+rate-limit voor een check elke paar minuten. Kraken is bewust gekozen boven
+Binance: Binance's publieke API blokkeert verzoeken vanuit de VS (HTTP 451),
+en GitHub Actions-runners draaien doorgaans in de VS — Kraken heeft die
+blokkade niet. Berekent SMA20, SMA50, RSI14 en steun/weerstand-niveaus,
+detecteert een regelgebaseerd buy/sell-signaal en stuurt daarbij optioneel
+een pushmelding via ntfy.sh.
 
 Twee manieren om te draaien:
   - python gold_analysis.py         -> blijft continu draaien (elke
@@ -73,11 +76,13 @@ HEARTBEAT_EVERY_N_CHECKS = max(1, round(HEARTBEAT_INTERVAL_MINUTES / CHECK_INTER
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kerim-goud-signalen-1x61")
 
 # Eén bron voor zowel de live prijs als de historische candles, zodat er
-# nooit een spot/futures-mismatch binnen één check kan ontstaan.
-SPOT_SYMBOL = "PAXGUSDT"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-HISTORY_PARAMS = {"symbol": SPOT_SYMBOL, "interval": "1d", "limit": 100}
+# nooit een spot/futures-mismatch binnen één check kan ontstaan. Kraken i.p.v.
+# Binance omdat Binance vanuit de VS (o.a. GitHub Actions-runners) met
+# HTTP 451 wordt geblokkeerd.
+SPOT_PAIR = "PAXGUSD"
+KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+HISTORY_DAYS = 100  # zonder 'since' geeft Kraken tot 720 candles (~2 jaar) terug
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 SMA_SHORT = 20
@@ -131,41 +136,46 @@ def _get_with_retry(url, timeout=10, retries=1, backoff=3, **kwargs):
     raise last_exc
 
 
-def _fetch_klines():
-    resp = _get_with_retry(BINANCE_KLINES_URL, params=HISTORY_PARAMS, timeout=15)
-    return resp.json()
+def _fetch_ohlc():
+    since = int(time.time()) - HISTORY_DAYS * 86400
+    params = {"pair": SPOT_PAIR, "interval": 1440, "since": since}
+    resp = _get_with_retry(KRAKEN_OHLC_URL, params=params, timeout=15)
+    payload = resp.json()
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken OHLC-endpoint gaf een fout terug: {payload['error']}")
+    return payload["result"][SPOT_PAIR]
 
 
 def fetch_current_price():
-    # Zelfde bron (Binance) als fetch_history(), zodat prijs en candles nooit
+    # Zelfde bron (Kraken) als fetch_history(), zodat prijs en candles nooit
     # uit twee verschillende markten komen binnen één check. Als de losse
-    # ticker-aanroep faalt, valt dit terug op de laatste klines-close van
+    # ticker-aanroep faalt, valt dit terug op de laatste OHLC-close van
     # dezelfde bron — geen kruisbestuiving met een andere markt/aanbieder.
     try:
-        resp = _get_with_retry(BINANCE_TICKER_URL, params={"symbol": SPOT_SYMBOL}, timeout=10)
-        return float(resp.json()["price"])
+        resp = _get_with_retry(KRAKEN_TICKER_URL, params={"pair": SPOT_PAIR}, timeout=10)
+        payload = resp.json()
+        if payload.get("error"):
+            raise RuntimeError(f"Kraken Ticker-endpoint gaf een fout terug: {payload['error']}")
+        return float(payload["result"][SPOT_PAIR]["c"][0])  # c[0] = laatste handelsprijs
     except Exception as primary_error:
         try:
-            klines = _fetch_klines()
-            return float(klines[-1][4])  # index 4 = close
+            ohlc = _fetch_ohlc()
+            return float(ohlc[-1][4])  # index 4 = close
         except Exception as fallback_error:
             raise RuntimeError(
-                "Kan de actuele XAUUSD-prijs (via PAXG/USDT op Binance) niet ophalen: "
-                f"ticker-endpoint faalde ({primary_error}) en de klines-backup faalde ook ({fallback_error})"
+                "Kan de actuele XAUUSD-prijs (via PAXG/USD op Kraken) niet ophalen: "
+                f"ticker-endpoint faalde ({primary_error}) en de OHLC-backup faalde ook ({fallback_error})"
             )
 
 
 def fetch_history():
     try:
-        klines = _fetch_klines()
+        ohlc = _fetch_ohlc()
         df = pd.DataFrame(
-            klines,
-            columns=[
-                "OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
-                "QuoteVolume", "Trades", "TakerBaseVolume", "TakerQuoteVolume", "Ignore",
-            ],
+            ohlc,
+            columns=["Time", "Open", "High", "Low", "Close", "VWAP", "Volume", "Trades"],
         )
-        df["Date"] = pd.to_datetime(df["OpenTime"], unit="ms").dt.normalize()
+        df["Date"] = pd.to_datetime(df["Time"], unit="s").dt.normalize()
         for col in ("Open", "High", "Low", "Close", "Volume"):
             df[col] = df[col].astype(float)
         df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
@@ -174,7 +184,7 @@ def fetch_history():
             raise ValueError("lege historische dataset ontvangen")
         return df
     except Exception as e:
-        raise RuntimeError(f"Kan historische XAUUSD-data (via PAXG/USDT op Binance) niet ophalen: {e}")
+        raise RuntimeError(f"Kan historische XAUUSD-data (via PAXG/USD op Kraken) niet ophalen: {e}")
 
 
 def compute_rsi(close, period=RSI_PERIOD):
@@ -402,20 +412,25 @@ def encode_header_value(value):
 
 
 def send_ntfy(title, message):
+    # Elke ntfy-poging krijgt een expliciete, niet te missen logregel — succes
+    # of mislukt — zodat een falende melding nooit stilletjes verdwijnt in de
+    # GitHub Actions-logs.
     if not NTFY_TOPIC or "wijzig-dit" in NTFY_TOPIC:
-        print("Let op: NTFY_TOPIC is nog niet aangepast naar een eigen unieke naam "
-              "— pushmelding wordt overgeslagen.")
+        print(f"[NTFY] MISLUKT ({title}): NTFY_TOPIC is nog niet aangepast naar een eigen "
+              f"unieke naam — melding overgeslagen.")
         return False
     try:
-        SESSION.post(
+        resp = SESSION.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
             headers={"Title": encode_header_value(title)},
             timeout=10,
         )
+        resp.raise_for_status()
+        print(f"[NTFY] OK ({title}): melding verstuurd naar ntfy.sh/{NTFY_TOPIC}")
         return True
     except Exception as e:
-        print(f"Kon pushmelding niet versturen naar ntfy.sh: {e}")
+        print(f"[NTFY] MISLUKT ({title}): kon niet versturen naar ntfy.sh/{NTFY_TOPIC}: {e}")
         return False
 
 
@@ -433,8 +448,7 @@ def send_signal_notification(signal):
         rr_txt = f" (R:R {signal['rr2']:.2f})" if signal["rr2"] is not None else ""
         lines.append(f"TP2: {signal['tp2']:.2f}{rr_txt}")
     message = "\n".join(lines)
-    if send_ntfy("GOUD SIGNAAL", message):
-        print(f"Pushmelding (signaal) verstuurd naar ntfy.sh/{NTFY_TOPIC}")
+    send_ntfy("GOUD SIGNAAL", message)
 
 
 def send_heartbeat_notification(now, current_price, rsi, signal):
@@ -442,8 +456,7 @@ def send_heartbeat_notification(now, current_price, rsi, signal):
     rsi_txt = format_nl(rsi) if rsi is not None else "n.v.t."
     status_txt = f"{signal['direction']}-setup actief" if signal is not None else "nog geen setup"
     message = f"{time_txt} — Prijs: {format_nl(current_price)}, RSI: {rsi_txt}, {status_txt}"
-    if send_ntfy("Goud check — actief", message):
-        print(f"Heartbeat verstuurd naar ntfy.sh/{NTFY_TOPIC}: \"{message}\"")
+    send_ntfy("Goud check — actief", message)
 
 
 def make_chart(df, support_levels, resistance_levels, current_price, signal):
@@ -565,7 +578,7 @@ def run_forever():
             try:
                 run_once(send_heartbeat=is_heartbeat_tick)
             except Exception as e:
-                print(f"[{timestamp}] FOUT tijdens deze check: {e}")
+                print_check_failed(timestamp, e)
                 if is_heartbeat_tick:
                     print(f"[{timestamp}] Heartbeat overgeslagen deze ronde wegens fout "
                           f"(volgende heartbeat over {HEARTBEAT_EVERY_N_CHECKS} checks).")
@@ -582,48 +595,59 @@ def _heartbeat_block_start(now):
     return block_start.strftime("%Y-%m-%dT%H:%M")
 
 
-def should_send_heartbeat(now):
-    # Stateless-veilige heartbeat via een klein statusbestand i.p.v. een
-    # tijdvenster: "is dit een nieuw HEARTBEAT_INTERVAL_MINUTES-blok t.o.v. de
-    # laatst opgeslagen waarde?". Dat werkt correct bij elke vertraging (ook
-    # 10+ minuten of een overgeslagen tik) en stuurt nooit dubbel, ook niet als
-    # er toevallig meerdere checks binnen hetzelfde blok op tijd draaien.
-    current_block = _heartbeat_block_start(now)
-    last_block = None
+def _read_last_heartbeat_block():
     try:
         if os.path.exists(HEARTBEAT_STATE_PATH):
             with open(HEARTBEAT_STATE_PATH, "r", encoding="utf-8") as f:
-                last_block = f.read().strip()
+                return f.read().strip()
     except OSError as e:
         print(f"Let op: kon heartbeat-statusbestand niet lezen ({e}); "
               f"ga uit van 'nog geen eerdere heartbeat'.")
+    return None
 
-    if last_block == current_block:
-        return False
 
+def _mark_heartbeat_block_done(block):
     try:
         with open(HEARTBEAT_STATE_PATH, "w", encoding="utf-8") as f:
-            f.write(current_block)
+            f.write(block)
     except OSError as e:
         print(f"Let op: kon heartbeat-statusbestand niet wegschrijven ({e}).")
 
-    return True
+
+def print_check_failed(timestamp, error):
+    # Een luide, niet te missen waarschuwing i.p.v. één stille printregel,
+    # zodat een volledig mislukte check (bv. de bron onbereikbaar) meteen
+    # opvalt in de GitHub Actions-logs, in plaats van te verdwijnen naast een
+    # groen "Success"-vinkje.
+    print("!" * 60)
+    print(f"[{timestamp}] KRITIEKE FOUT: de volledige check is mislukt — geen prijs/candles "
+          f"opgehaald, geen signaalcheck, geen ntfy-poging deze ronde.")
+    print(f"[{timestamp}] Reden: {error}")
+    print("!" * 60)
 
 
 def run_once_stateless():
     # Voor gebruik in een scheduler (GitHub Actions, cron): elke aanroep is
     # een nieuw proces zonder in-memory geheugen van vorige runs, dus de
     # heartbeat-telling van run_forever() werkt hier niet. In plaats daarvan
-    # bepaalt should_send_heartbeat() dit via het statusbestand.
+    # wordt het statusbestand gebruikt — en pas bijgewerkt NA een geslaagde
+    # check, zodat een falende run het heartbeat-ritme niet stilletjes laat
+    # "doortikken" zonder dat er ooit echt een melding is verstuurd.
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    is_heartbeat = should_send_heartbeat(now)
+    current_block = _heartbeat_block_start(now)
+    is_heartbeat = _read_last_heartbeat_block() != current_block
     try:
         run_once(send_heartbeat=is_heartbeat)
     except Exception as e:
-        print(f"[{timestamp}] FOUT tijdens deze check: {e}")
+        print_check_failed(timestamp, e)
         if is_heartbeat:
-            print(f"[{timestamp}] Heartbeat overgeslagen deze ronde wegens fout.")
+            print(f"[{timestamp}] Heartbeat NIET verstuurd en NIET als afgehandeld gemarkeerd "
+                  f"— wordt bij de volgende geslaagde check opnieuw geprobeerd.")
+        return
+
+    if is_heartbeat:
+        _mark_heartbeat_block_done(current_block)
 
 
 if __name__ == "__main__":
