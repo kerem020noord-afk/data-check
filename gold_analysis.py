@@ -31,6 +31,7 @@ import base64
 import argparse
 import subprocess
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # pandas en matplotlib zijn hier gepind op versies die niet worden geblokkeerd
 # door Windows Smart App Control / applicatiebeheerbeleid (recente pip-wheels
@@ -66,6 +67,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ============================= CONFIG =============================
+# Alle tijdstempels in meldingen/logs gebruiken expliciet deze tijdzone i.p.v.
+# de systeemklok. Nodig omdat GitHub Actions-runners op UTC draaien: zonder
+# dit zou een melding "20:44" tonen terwijl het lokaal (Nederland) 22:44 is,
+# wat de vermelde prijs ten onrechte "fout" doet lijken bij het terugkijken.
+LOCAL_TZ = ZoneInfo("Europe/Amsterdam")
+
 CHECK_INTERVAL_MINUTES = 5  # hoe vaak de analyse opnieuw draait
 HEARTBEAT_INTERVAL_MINUTES = 20  # hoe vaak er een heartbeat-melding gaat, ook zonder setup (4 checks)
 HEARTBEAT_EVERY_N_CHECKS = max(1, round(HEARTBEAT_INTERVAL_MINUTES / CHECK_INTERVAL_MINUTES))
@@ -139,6 +146,10 @@ EARLY_WARNING_DISCLAIMER = (
 
 SESSION = requests.Session()
 SESSION.headers.update(REQUEST_HEADERS)
+
+
+def now_local():
+    return datetime.now(LOCAL_TZ)
 
 
 def _get_with_retry(url, timeout=10, retries=1, backoff=3, **kwargs):
@@ -462,6 +473,36 @@ def detect_early_warnings(current_price, rsi, df, nearest_support, nearest_resis
     return warnings
 
 
+def warning_direction(warnings):
+    # Alleen een richting teruggeven als de actieve waarschuwingen het EENS
+    # zijn (squeeze heeft geen richting en telt niet mee). Bij tegenstrijdige
+    # signalen (bv. RSI nadert oversold, prijs nadert weerstand) geven we
+    # bewust geen richting/zone — dat zou een schijnzekerheid suggereren.
+    directions = {w["direction"] for w in warnings if w["direction"] is not None}
+    return directions.pop() if len(directions) == 1 else None
+
+
+def build_warning_zone(direction, current_price, nearest_support, nearest_resistance,
+                        support_levels, resistance_levels):
+    if direction == "BUY":
+        sl_ref = nearest_support if nearest_support is not None else current_price
+        zone_low, zone_high = sl_ref, current_price
+        sl = sl_ref * (1 - SL_BUFFER_PCT)
+        targets = sorted(r for r in resistance_levels if r > current_price)
+    else:  # SELL
+        sl_ref = nearest_resistance if nearest_resistance is not None else current_price
+        zone_low, zone_high = current_price, sl_ref
+        sl = sl_ref * (1 + SL_BUFFER_PCT)
+        targets = sorted((s for s in support_levels if s < current_price), reverse=True)
+    return {
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "sl": sl,
+        "tp1": targets[0] if targets else None,
+        "tp2": targets[1] if len(targets) > 1 else None,
+    }
+
+
 def detect_signal(current_price, rsi, df, support_levels, resistance_levels,
                    nearest_support, nearest_resistance):
     reasons_buy, reasons_sell = [], []
@@ -592,19 +633,32 @@ def should_send_warning(now, warnings):
     key = ",".join(sorted(w["key"] for w in warnings))
     last_time, last_key = _read_warning_state()
     if last_key == key and last_time is not None:
-        elapsed_minutes = (now - last_time).total_seconds() / 60
-        if elapsed_minutes < WARNING_COOLDOWN_MINUTES:
-            return False, key
+        try:
+            elapsed_minutes = (now - last_time).total_seconds() / 60
+            if elapsed_minutes < WARNING_COOLDOWN_MINUTES:
+                return False, key
+        except TypeError:
+            pass  # oude/naive tijdstempel uit een eerdere versie; behandel als 'geen eerdere state'
     return True, key
 
 
-def send_warning_notification(now, current_price, warnings):
+def send_warning_notification(now, current_price, warnings, direction, zone):
     lines = [f"Prijs: {format_nl(current_price)}"]
+    if direction is not None:
+        lines.append(f"Mogelijke richting: {direction}")
     for w in warnings:
         lines.append(f"- {w['reason']}")
+    if zone is not None:
+        lines.append(f"Zone: {format_nl(zone['zone_low'])} - {format_nl(zone['zone_high'])}")
+        lines.append(f"Stop Loss (indicatief): {format_nl(zone['sl'])}")
+        if zone["tp1"] is not None:
+            lines.append(f"TP1 (indicatief): {format_nl(zone['tp1'])}")
+        if zone["tp2"] is not None:
+            lines.append(f"TP2 (indicatief): {format_nl(zone['tp2'])}")
     lines.append(EARLY_WARNING_DISCLAIMER)
     message = "\n".join(lines)
-    send_ntfy("GOUD VROEGE WAARSCHUWING", message)
+    title = "GOUD VROEGE WAARSCHUWING" + (f" ({direction})" if direction else "")
+    send_ntfy(title, message)
 
 
 def make_chart(df, support_levels, resistance_levels, current_price, signal):
@@ -648,8 +702,8 @@ def make_chart(df, support_levels, resistance_levels, current_price, signal):
 
 
 def run_once(send_heartbeat=False):
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    now = now_local()
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
 
     current_price = fetch_current_price()
     df = fetch_history()
@@ -707,11 +761,26 @@ def run_once(send_heartbeat=False):
     print("-" * 60)
     should_warn, warning_key = should_send_warning(now, warnings)
     if warnings:
+        direction = warning_direction(warnings)
+        zone = None
+        if direction is not None:
+            zone = build_warning_zone(
+                direction, current_price, nearest_support, nearest_resistance,
+                support_levels, resistance_levels,
+            )
         print(f"Vroege waarschuwing(en) actief ({len(warnings)}):")
         for w in warnings:
             print(f"  - {w['reason']}")
+        if direction is not None:
+            print(f"Mogelijke richting: {direction}")
+            print(f"  Zone      : {zone['zone_low']:.2f} - {zone['zone_high']:.2f}")
+            print(f"  Stop Loss : {zone['sl']:.2f} (indicatief)")
+            print(f"  TP1       : {zone['tp1']:.2f} (indicatief)" if zone["tp1"] is not None else "  TP1       : geen volgend niveau gevonden")
+            print(f"  TP2       : {zone['tp2']:.2f} (indicatief)" if zone["tp2"] is not None else "  TP2       : geen volgend niveau gevonden")
+        else:
+            print("Mogelijke richting: geen eenduidige richting (tegenstrijdig of alleen squeeze) — geen zone getoond.")
         if should_warn:
-            send_warning_notification(now, current_price, warnings)
+            send_warning_notification(now, current_price, warnings, direction, zone)
             _mark_warning_sent(now, warning_key)
         else:
             print("Geen nieuwe waarschuwingsmelding (zelfde conditie recent al gestuurd, cooldown actief).")
@@ -739,7 +808,7 @@ def run_forever():
         while True:
             tick_count += 1  # telt elke ronde, ook bij een mislukte check, zodat het uur-ritme niet verspringt
             is_heartbeat_tick = (tick_count == 1) or (tick_count % HEARTBEAT_EVERY_N_CHECKS == 0)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = now_local().strftime("%Y-%m-%d %H:%M:%S %Z")
             try:
                 run_once(send_heartbeat=is_heartbeat_tick)
             except Exception as e:
@@ -798,8 +867,8 @@ def run_once_stateless():
     # wordt het statusbestand gebruikt — en pas bijgewerkt NA een geslaagde
     # check, zodat een falende run het heartbeat-ritme niet stilletjes laat
     # "doortikken" zonder dat er ooit echt een melding is verstuurd.
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    now = now_local()
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
     current_block = _heartbeat_block_start(now)
     is_heartbeat = _read_last_heartbeat_block() != current_block
     try:
