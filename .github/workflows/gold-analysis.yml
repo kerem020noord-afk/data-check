@@ -30,14 +30,14 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python gold_analysis.py --once
 
-      - name: Heartbeat-status opslaan
+      - name: Status opslaan (heartbeat + waarschuwingen)
         run: |
-          if [ -n "$(git status --porcelain heartbeat_state.txt)" ]; then
+          if [ -n "$(git status --porcelain heartbeat_state.txt warning_state.txt)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add heartbeat_state.txt
-            git commit -m "Heartbeat-status bijwerken [skip ci]"
+            git add heartbeat_state.txt warning_state.txt
+            git commit -m "Status bijwerken (heartbeat/waarschuwingen) [skip ci]"
             git push
           else
-            echo "Geen wijziging in heartbeat-status, niets te committen."
+            echo "Geen wijziging in status, niets te committen."
           fi

@@ -104,6 +104,16 @@ REJECTION_PROXIMITY_PCT = 0.005  # hoe dicht high/low een niveau moet raken (0,5
 REJECTION_WICK_RATIO = 0.55      # schaduw moet minstens dit deel van de candle-range zijn
 TREND_CONFIRM_CANDLES = 3        # opeenvolgende hogere/lagere toppen+bodems voor trendbevestiging
 
+# Vroege-waarschuwing-detectie: apart van en ruimer dan de echte GOUD SIGNAAL-
+# drempels hierboven. Bedoeld om eerder te alarmeren op basis van dezelfde,
+# nu al beschikbare data — geen voorspelling van toekomstige prijs.
+EARLY_WARNING_RSI_BUFFER = 5          # RSI binnen deze marge van 35/65 telt als 'nadert'
+EARLY_WARNING_LEVEL_PROXIMITY_PCT = 0.01  # 1% i.p.v. de 0,3% van een echt signaal
+SQUEEZE_LOOKBACK_SHORT = 5            # candles voor de korte-termijn-range
+SQUEEZE_LOOKBACK_LONG = 20            # candles voor de normale-range-baseline
+SQUEEZE_RATIO_THRESHOLD = 0.6         # korte range moet dit x kleiner zijn dan normaal
+WARNING_COOLDOWN_MINUTES = 60         # min. tijd tussen twee waarschuwingen met dezelfde inhoud
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(SCRIPT_DIR, "gold_analysis.csv")
 CHART_PATH = os.path.join(SCRIPT_DIR, "gold_chart.png")
@@ -112,9 +122,18 @@ CHART_PATH = os.path.join(SCRIPT_DIR, "gold_chart.png")
 # ook zonder gedeeld procesgeheugen precies 1x per HEARTBEAT_INTERVAL_MINUTES
 # een heartbeat stuurt, hoe lang een cron-tik ook vertraagd is.
 HEARTBEAT_STATE_PATH = os.path.join(SCRIPT_DIR, "heartbeat_state.txt")
+# Onthoudt de laatst verstuurde vroege-waarschuwing (inhoud + tijdstip), zodat
+# een aanhoudende conditie niet elke paar minuten opnieuw meldt. Wordt net als
+# heartbeat_state.txt door de GitHub Actions-workflow teruggecommit.
+WARNING_STATE_PATH = os.path.join(SCRIPT_DIR, "warning_state.txt")
 DISCLAIMER = (
     "Dit is een op regels gebaseerde indicatie, geen voorspelling. "
     "Wacht altijd op bevestiging op de grafiek zelf voordat je handelt."
+)
+EARLY_WARNING_DISCLAIMER = (
+    "Vroege waarschuwing, geen signaal: condities naderen een drempel of "
+    "volatiliteit is samengeperst. Dit voorspelt geen richting of timing — "
+    "puur een 'let op' op basis van dezelfde regels."
 )
 # ====================================================================
 
@@ -361,6 +380,88 @@ def detect_trend_confirmation(df, n=TREND_CONFIRM_CANDLES):
     return None
 
 
+def detect_rsi_approaching(rsi, df, buffer=EARLY_WARNING_RSI_BUFFER):
+    # RSI binnen `buffer` punten van 35/65 én nog bewegend in die richting
+    # (niet net omgekeerd) — een vroeg 'let op', geen bevestigd signaal.
+    if rsi is None or len(df) < 4:
+        return None
+    prev_rsi = df["RSI14"].iloc[-4]
+    if pd.isna(prev_rsi):
+        return None
+    if RSI_OVERSOLD <= rsi < RSI_OVERSOLD + buffer and rsi < prev_rsi:
+        return {
+            "key": "rsi_approach_buy",
+            "direction": "BUY",
+            "reason": f"RSI nadert oversold: {rsi:.1f} en dalend (was {prev_rsi:.1f})",
+        }
+    if RSI_OVERBOUGHT - buffer < rsi <= RSI_OVERBOUGHT and rsi > prev_rsi:
+        return {
+            "key": "rsi_approach_sell",
+            "direction": "SELL",
+            "reason": f"RSI nadert overbought: {rsi:.1f} en stijgend (was {prev_rsi:.1f})",
+        }
+    return None
+
+
+def detect_level_approaching(current_price, nearest_support, nearest_resistance,
+                              proximity_pct=EARLY_WARNING_LEVEL_PROXIMITY_PCT):
+    # Prijs binnen een ruimere marge (1%) van een niveau, maar nog niet binnen
+    # de strakke 0,3% die een echt signaal vereist.
+    if nearest_support is not None:
+        dist = abs(current_price - nearest_support) / nearest_support
+        if PROXIMITY_PCT < dist <= proximity_pct:
+            return {
+                "key": "level_approach_buy",
+                "direction": "BUY",
+                "reason": f"prijs nadert steun {nearest_support:.2f} (nu {dist:.2%} weg)",
+            }
+    if nearest_resistance is not None:
+        dist = abs(current_price - nearest_resistance) / nearest_resistance
+        if PROXIMITY_PCT < dist <= proximity_pct:
+            return {
+                "key": "level_approach_sell",
+                "direction": "SELL",
+                "reason": f"prijs nadert weerstand {nearest_resistance:.2f} (nu {dist:.2%} weg)",
+            }
+    return None
+
+
+def detect_volatility_squeeze(df, short=SQUEEZE_LOOKBACK_SHORT, long=SQUEEZE_LOOKBACK_LONG,
+                               threshold=SQUEEZE_RATIO_THRESHOLD):
+    # Ongebruikelijk kleine ranges t.o.v. de normale baseline duiden vaak op
+    # een 'samenpersing' vlak vóór een uitbraak — het 'voorspellende' deel:
+    # verhoogde kans op een grote beweging, zonder richting.
+    if len(df) < long + 1:
+        return None
+    ranges = df["High"] - df["Low"]
+    avg_short = ranges.iloc[-short:].mean()
+    avg_long = ranges.iloc[-(long + 1):-1].mean()
+    if avg_long <= 0:
+        return None
+    ratio = avg_short / avg_long
+    if ratio <= threshold:
+        return {
+            "key": "squeeze",
+            "direction": None,
+            "reason": f"volatiliteit samengeperst: laatste {short} candles gemiddeld {ratio:.1f}x "
+                      f"de normale range van {long} candles — verhoogde kans op een uitbraak "
+                      f"(richting onbekend)",
+        }
+    return None
+
+
+def detect_early_warnings(current_price, rsi, df, nearest_support, nearest_resistance):
+    warnings = []
+    for w in (
+        detect_rsi_approaching(rsi, df),
+        detect_level_approaching(current_price, nearest_support, nearest_resistance),
+        detect_volatility_squeeze(df),
+    ):
+        if w is not None:
+            warnings.append(w)
+    return warnings
+
+
 def detect_signal(current_price, rsi, df, support_levels, resistance_levels,
                    nearest_support, nearest_resistance):
     reasons_buy, reasons_sell = [], []
@@ -459,6 +560,53 @@ def send_heartbeat_notification(now, current_price, rsi, signal):
     send_ntfy("Goud check — actief", message)
 
 
+def _read_warning_state():
+    try:
+        if os.path.exists(WARNING_STATE_PATH):
+            with open(WARNING_STATE_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if "|" in content:
+                ts_str, key = content.split("|", 1)
+                return datetime.fromisoformat(ts_str), key
+    except (OSError, ValueError) as e:
+        print(f"Let op: kon waarschuwing-statusbestand niet lezen ({e}); "
+              f"ga uit van 'nog geen eerdere waarschuwing'.")
+    return None, None
+
+
+def _mark_warning_sent(now, key):
+    try:
+        with open(WARNING_STATE_PATH, "w", encoding="utf-8") as f:
+            f.write(f"{now.isoformat()}|{key}")
+    except OSError as e:
+        print(f"Let op: kon waarschuwing-statusbestand niet wegschrijven ({e}).")
+
+
+def should_send_warning(now, warnings):
+    # Stuur alleen als de combinatie van actieve waarschuwingen NIEUW is, of
+    # als dezelfde combinatie al langer dan WARNING_COOLDOWN_MINUTES aanhoudt
+    # — zo geen herhaalspam zolang een conditie blijft gelden, maar wel een
+    # nieuwe melding zodra er iets verandert (bv. squeeze komt erbij).
+    if not warnings:
+        return False, None
+    key = ",".join(sorted(w["key"] for w in warnings))
+    last_time, last_key = _read_warning_state()
+    if last_key == key and last_time is not None:
+        elapsed_minutes = (now - last_time).total_seconds() / 60
+        if elapsed_minutes < WARNING_COOLDOWN_MINUTES:
+            return False, key
+    return True, key
+
+
+def send_warning_notification(now, current_price, warnings):
+    lines = [f"Prijs: {format_nl(current_price)}"]
+    for w in warnings:
+        lines.append(f"- {w['reason']}")
+    lines.append(EARLY_WARNING_DISCLAIMER)
+    message = "\n".join(lines)
+    send_ntfy("GOUD VROEGE WAARSCHUWING", message)
+
+
 def make_chart(df, support_levels, resistance_levels, current_price, signal):
     fig, ax = plt.subplots(figsize=(13, 7))
     try:
@@ -522,6 +670,9 @@ def run_once(send_heartbeat=False):
         current_price, current_rsi, df, support_levels, resistance_levels,
         nearest_support, nearest_resistance,
     )
+    warnings = detect_early_warnings(
+        current_price, current_rsi, df, nearest_support, nearest_resistance,
+    )
 
     make_chart(df, support_levels, resistance_levels, current_price, signal)
 
@@ -552,6 +703,20 @@ def run_once(send_heartbeat=False):
         send_signal_notification(signal)
     else:
         print("Geen duidelijke setup op dit moment.")
+
+    print("-" * 60)
+    should_warn, warning_key = should_send_warning(now, warnings)
+    if warnings:
+        print(f"Vroege waarschuwing(en) actief ({len(warnings)}):")
+        for w in warnings:
+            print(f"  - {w['reason']}")
+        if should_warn:
+            send_warning_notification(now, current_price, warnings)
+            _mark_warning_sent(now, warning_key)
+        else:
+            print("Geen nieuwe waarschuwingsmelding (zelfde conditie recent al gestuurd, cooldown actief).")
+    else:
+        print("Geen vroege waarschuwingen op dit moment.")
 
     print("-" * 60)
     if send_heartbeat:
